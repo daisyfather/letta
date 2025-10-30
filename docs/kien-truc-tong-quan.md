@@ -3,34 +3,87 @@
 ## Mục đích
 Tài liệu này mô tả kiến trúc tổng quan của Letta – nền tảng xây dựng agent có trạng thái với hệ thống bộ nhớ phân cấp. Kiến trúc được thiết kế để hỗ trợ triển khai đa môi trường (cloud, self-hosted) và mở rộng qua SDK Python/TypeScript.
 
-## Các lớp thành phần chính
+## Kiến trúc tổng thể
+Biểu đồ dưới đây thể hiện các thành phần chính và mối quan hệ của chúng trong một phiên làm việc tiêu chuẩn.
 
-### 1. Lớp biên API & giao thức
-Letta cung cấp REST API và WebSocket/stream dựa trên FastAPI. Ứng dụng khởi tạo trong `letta/server/rest_api/app.py` với FastAPI và cấu hình lifespan để chuẩn bị server đồng bộ, job scheduler, CORS và giám sát.【F:letta/server/rest_api/app.py†L12-L189】 Tầng này gắn các router `/v1` cho agent, message, tool… giúp client SDK và ADE giao tiếp thống nhất.【F:letta/server/rest_api/routers/v1/agents.py†L69-L200】【F:letta/server/rest_api/routers/v1/messages.py†L16-L171】
+```mermaid
+graph TD
+    subgraph Clients
+        SDK[SDK & Apps]
+        UI[CLI / UI]
+        Webhook[Webhook Integrations]
+    end
 
-### 2. Lớp điều phối server đồng bộ
-`SyncServer` trong `letta/server/server.py` giữ trạng thái hệ thống chạy agent, khởi tạo các manager truy cập dữ liệu (agent, message, block, tool, job…), cấu hình kết nối cơ sở dữ liệu và HTTP client dùng chung.【F:letta/server/server.py†L117-L200】 Server cũng duy trì cache cấu hình mô hình và client MCP để hỗ trợ tool bên ngoài.【F:letta/server/server.py†L192-L199】
+    subgraph API[FastAPI Surface]
+        Router[REST & Streaming Routers]
+        Lifespan[Lifespan Bootstrap]
+    end
 
-### 3. Lớp dịch vụ nghiệp vụ (Service Managers)
-Các service manager (ví dụ `AgentManager`, `MessageManager`, `ToolManager`) chịu trách nhiệm giao tiếp ORM, tính toán context window, quản lý nguồn dữ liệu, công cụ và telemetry.【F:letta/services/agent_manager.py†L1-L200】 Các manager được `SyncServer` và Agent runtime sử dụng lại để đảm bảo logic thống nhất giữa API, job scheduler và batch runner.【F:letta/agent.py†L142-L148】
+    subgraph Runtime[SyncServer & Runtime]
+        Server[SyncServer]
+        Managers[Service Managers]
+        Agent[Agent Runtime]
+        Tools[Tool Sandbox]
+        Memory[Memory Stores]
+        Jobs[Job Scheduler]
+    end
 
-### 4. Lớp Agent Runtime
-`Agent` trong `letta/agent.py` hiện thực vòng lặp suy luận của agent, tương tác với LLM, dịch vụ bộ nhớ, quản lý tool rules và xử lý chain/heartbeat để duy trì hội thoại dài hạn.【F:letta/agent.py†L96-L834】 Lớp này kết nối tới interface streaming (CLI/REST), managers và telemetry nhằm duy trì trạng thái agent, ghi log bước và áp dụng cảnh báo bộ nhớ.【F:letta/agent.py†L768-L1019】
+    Clients --> Router
+    Router --> Lifespan
+    Lifespan --> Server
+    Server --> Managers
+    Server --> Agent
+    Agent --> Memory
+    Agent --> Tools
+    Agent --> Jobs
+    Managers --> Memory
+    Managers --> Tools
+```
 
-### 5. Lớp bộ nhớ và ngữ cảnh
-Bộ nhớ trong bối cảnh (core memory) được biểu diễn bằng `Memory` (các block có nhãn, giới hạn, thuộc tính read-only, file).【F:letta/schemas/memory.py†L31-L124】 Dịch vụ `ContextWindowCalculator` tính toán phân bổ token giữa system prompt, memory, summary và message, giúp agent tự điều chỉnh lượng thông tin trong context.【F:letta/services/context_window_calculator/context_window_calculator.py†L19-L193】
+- **FastAPI Routers** khởi tạo trong `letta/server/rest_api/app.py`, gắn các router `/v1` để xử lý agent, message, tool và trả kết quả qua REST/WebSocket.【F:letta/server/rest_api/app.py†L12-L189】【F:letta/server/rest_api/routers/v1/agents.py†L69-L200】【F:letta/server/rest_api/routers/v1/messages.py†L16-L171】
+- **SyncServer** quản lý cấu hình hệ thống, khởi tạo các manager và cache LLM/tool, đóng vai trò nhịp tim cho toàn bộ runtime.【F:letta/server/server.py†L117-L199】
+- **Service Managers** chịu trách nhiệm tương tác cơ sở dữ liệu, quản lý agent/message/memory/tool một cách thống nhất cho API, scheduler và batch runner.【F:letta/services/agent_manager.py†L1-L200】
+- **Agent Runtime** triển khai vòng lặp suy luận, tương tác LLM, điều phối tool và telemetry, duy trì trạng thái hội thoại dài hạn.【F:letta/agent.py†L96-L1019】
+- **Tool Sandbox** cung cấp cơ chế thực thi công cụ an toàn (local hoặc từ xa) với quản lý lifecycle và thu thập log.【F:letta/services/tool_executor/tool_execution_sandbox.py†L37-L200】
+- **Memory Stores** biểu diễn core memory, summary và block file theo schema giàu metadata giúp agent đọc/ghi chọn lọc.【F:letta/schemas/memory.py†L31-L124】
+- **Job Scheduler** khởi động trong lifespan để chạy batch, tác vụ tổng hợp và các job nền khác.【F:letta/server/rest_api/app.py†L122-L189】
 
-### 6. Lớp công cụ và sandbox
-Công cụ được thực thi thông qua `ToolExecutionSandbox`, hỗ trợ sandbox cục bộ hoặc dịch vụ E2B/Modal với cơ chế tạo môi trường, cài đặt dependency và log output an toàn.【F:letta/services/tool_executor/tool_execution_sandbox.py†L37-L200】 Điều này giúp agent mở rộng khả năng hành động nhưng vẫn kiểm soát rủi ro bảo mật.
+## Lượt xử lý API & luồng request
+Để minh họa request điển hình gửi tin nhắn tới agent, biểu đồ tuần tự sau mô tả các bước chính.
 
-## Luồng hoạt động tổng quát
-1. Client gửi yêu cầu (REST hoặc streaming). Router xác thực, lấy `SyncServer` và actor.【F:letta/server/rest_api/routers/v1/agents.py†L82-L159】
-2. `SyncServer` sử dụng các manager truy xuất trạng thái agent/memory, chuẩn bị cấu hình LLM, tool, sandbox.【F:letta/server/server.py†L151-L199】
-3. `Agent.step` chuyển đổi message, gọi LLM qua `LLMClient`, nhận phản hồi (bao gồm tool call) và ghi nhận usage.【F:letta/agent.py†L753-L1019】
-4. Nếu vượt ngưỡng context hoặc cần tổng hợp, Agent kích hoạt summarizer/ContextWindowCalculator để tái cấu hình bộ nhớ.【F:letta/agent.py†L945-L1040】【F:letta/services/context_window_calculator/context_window_calculator.py†L63-L193】
-5. Message, tool execution và telemetry được ghi qua các manager, trả kết quả về API/streaming.【F:letta/agent.py†L979-L1019】
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as FastAPI Router
+    participant Server as SyncServer
+    participant Manager as Agent/Message Managers
+    participant Agent as Agent Runtime
+    participant Memory as ContextWindow & Memory
+    participant LLM as LLM Client
+
+    Client->>Router: POST /v1/agents/{id}/messages
+    Router->>Server: Lấy SyncServer & actor context
+    Server->>Manager: Tải metadata agent, memory, tools
+    Server->>Agent: Tạo Agent runtime với context
+    Agent->>Memory: Phân bổ context & kiểm tra giới hạn
+    Agent->>LLM: Gửi prompt + memory blocks
+    LLM-->>Agent: Trả lời + Tool calls + Usage
+    Agent->>Manager: Lưu message, usage, tool events
+    Agent->>Memory: Cập nhật summary/core memory khi cần
+    Agent-->>Server: Kết quả cuối cùng
+    Server-->>Router: Response payload
+    Router-->>Client: Stream/JSON kết quả
+```
+
+Luồng này phản ánh các hành vi nổi bật:
+
+1. **Router** chịu trách nhiệm xác thực, ánh xạ payload sang schema và trích xuất `SyncServer` cho từng request.【F:letta/server/rest_api/routers/v1/agents.py†L82-L159】
+2. **SyncServer** hợp nhất dữ liệu cấu hình (agent, memory, tools) thông qua các manager và chuẩn bị các client (LLM, MCP, HTTP) dùng chung.【F:letta/server/server.py†L151-L199】
+3. **Agent Runtime** thực thi `step`, xử lý heartbeat, tool chain và ghi log telemetry trước khi trả kết quả cho API.【F:letta/agent.py†L753-L1019】
+4. **Memory Services** phân bổ token và tự động kích hoạt summarizer nếu context vượt ngưỡng, đảm bảo phản hồi ổn định.【F:letta/services/context_window_calculator/context_window_calculator.py†L19-L193】【F:letta/services/summarizer/summarizer.py†L27-L199】
+5. **Service Managers** lưu trữ kết quả, update usage và phát sự kiện cho batch/scheduler để bảo toàn tính nhất quán giữa API và job async.【F:letta/services/agent_manager.py†L1-L200】【F:letta/server/rest_api/routers/v1/messages.py†L171-L190】
 
 ## Đặc điểm kiến trúc nổi bật
-- **Stateful Agents**: mỗi agent có lịch sử vĩnh viễn, bộ nhớ phân cấp (core, summary, recall/archival) được quản lý bởi services chung.【F:letta/schemas/memory.py†L31-L118】【F:letta/services/context_window_calculator/context_window_calculator.py†L131-L193】
-- **Khả năng mở rộng multi-agent**: Shared memory blocks và group manager cho phép nhiều agent cùng truy cập nguồn kiến thức chung, kết hợp batch/loop engine trong routers v1.【F:letta/server/rest_api/routers/v1/agents.py†L181-L200】【F:letta/server/rest_api/routers/v1/messages.py†L21-L171】
-- **Tooling & Integration**: sandbox hóa tool, hỗ trợ MCP, batch job, telemetry OTEL giúp tích hợp hệ sinh thái phong phú mà vẫn đảm bảo an toàn và quan sát được.【F:letta/services/tool_executor/tool_execution_sandbox.py†L50-L200】【F:letta/server/server.py†L192-L199】
+- **Stateful Agents**: mỗi agent có lịch sử vĩnh viễn, bộ nhớ phân cấp (core, summary, recall/archival) được quản lý bởi services chung.【F:letta/schemas/memory.py†L31-L124】【F:letta/services/context_window_calculator/context_window_calculator.py†L131-L193】
+- **Khả năng mở rộng multi-agent**: Shared memory blocks và batch API cho phép nhiều agent cùng truy cập nguồn kiến thức chung, đồng thời hỗ trợ fan-out job.【F:letta/server/rest_api/routers/v1/agents.py†L181-L200】【F:letta/server/rest_api/routers/v1/messages.py†L21-L190】
+- **Tooling & Observability**: Sandbox hóa tool, hỗ trợ MCP, batch job và telemetry OTEL giúp tích hợp hệ sinh thái phong phú mà vẫn đảm bảo an toàn và quan sát được.【F:letta/services/tool_executor/tool_execution_sandbox.py†L37-L200】【F:letta/server/server.py†L192-L199】
